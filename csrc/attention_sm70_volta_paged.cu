@@ -112,7 +112,7 @@ flash_attention_sm70_paged_decode_kernel(
     int kv_pos = 0;
     for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
         const int physical_block = seq_block_table[block_idx];
-        const int tokens_in_block = min(block_size, seq_len - kv_pos);
+        const int total_in_block = min(block_size, seq_len - kv_pos);
 
         // Pointer to K and V in this block
         // Layout: [num_blocks, block_size, num_kv_heads, D]
@@ -123,87 +123,98 @@ flash_attention_sm70_paged_decode_kernel(
         const __half* v_block = V_cache +
             (size_t)physical_block * block_size * num_kv_heads * D;
 
-        // Load K and V for this block
-        for (int i = tid; i < tokens_in_block * D; i += THREADS) {
-            int token = i / D;
-            int d = i % D;
-            // Access: token * num_kv_heads * D + kv_head_idx * D + d
-            size_t kv_offset = (size_t)token * num_kv_heads * D + kv_head_idx * D + d;
-            smem.k[token * KV_STRIDE + d] = k_block[kv_offset];
-            smem.v[token * KV_STRIDE + d] = v_block[kv_offset];
-        }
-        __syncthreads();
+        // ---- Inner chunk loop ----
+        // SmemLayout sizes smem.k[BLOCK_N * KV_STRIDE] and smem.s[BLOCK_N], so
+        // we MUST process at most BLOCK_N tokens per softmax phase. vLLM uses
+        // block_size=1056 (much larger than BLOCK_N=64) so a single paged
+        // block needs many chunks. Each chunk runs a full online-softmax step
+        // and updates the running (row_max, row_sum, smem.o[]) state.
+        for (int chunk_start = 0; chunk_start < total_in_block;
+             chunk_start += BLOCK_N) {
+            const int tokens_in_chunk = min(BLOCK_N, total_in_block - chunk_start);
 
-        // Compute attention scores: S = Q @ K^T
-        // Using simple dot product (WMMA overkill for M=1)
-        for (int k_idx = tid; k_idx < tokens_in_block; k_idx += THREADS) {
-            float sum = 0.0f;
-            #pragma unroll 8
-            for (int d = 0; d < D; ++d) {
-                sum += __half2float(smem.q[d]) * __half2float(smem.k[k_idx * KV_STRIDE + d]);
+            // Load K and V for this chunk
+            for (int i = tid; i < tokens_in_chunk * D; i += THREADS) {
+                int token = i / D;             // 0..tokens_in_chunk-1, always <= BLOCK_N
+                int d = i % D;
+                // Within the paged block, the actual token index is chunk_start+token.
+                size_t kv_offset = (size_t)(chunk_start + token) * num_kv_heads * D
+                                 + kv_head_idx * D + d;
+                smem.k[token * KV_STRIDE + d] = k_block[kv_offset];
+                smem.v[token * KV_STRIDE + d] = v_block[kv_offset];
             }
-            smem.s[k_idx] = sum * softmax_scale;
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // Online softmax: find max (single warp, so warp shuffle works)
-        float local_max = NEG_INF;
-        for (int k_idx = tid; k_idx < tokens_in_block; k_idx += THREADS) {
-            local_max = fmaxf(local_max, smem.s[k_idx]);
-        }
-
-        // Reduce max across warp (32 threads)
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-        }
-        float block_max = __shfl_sync(0xffffffff, local_max, 0);
-
-        // Rescale previous accumulator
-        float old_max = smem.row_max;
-        float new_max = fmaxf(old_max, block_max);
-        float exp_diff = __expf(old_max - new_max);
-
-        // Compute exp and sum
-        float local_sum = 0.0f;
-        for (int k_idx = tid; k_idx < tokens_in_block; k_idx += THREADS) {
-            float e = __expf(smem.s[k_idx] - new_max);
-            smem.s[k_idx] = e;  // Store exp values for weighted sum
-            local_sum += e;
-        }
-        __syncthreads();  // Ensure all exp values are written before reduction
-
-        // Reduce sum across warp (32 threads)
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-        }
-        float block_sum = __shfl_sync(0xffffffff, local_sum, 0);
-
-        // Update running stats
-        if (tid == 0) {
-            smem.row_sum = exp_diff * smem.row_sum + block_sum;
-            smem.row_max = new_max;
-        }
-        __syncthreads();  // Ensure row_sum/row_max are visible
-
-        // Rescale output accumulator
-        for (int d = tid; d < D; d += THREADS) {
-            smem.o[d] *= exp_diff;
-        }
-        __syncthreads();
-
-        // Accumulate weighted values: O += S @ V
-        for (int d = tid; d < D; d += THREADS) {
-            float acc = 0.0f;
-            for (int k_idx = 0; k_idx < tokens_in_block; ++k_idx) {
-                acc += smem.s[k_idx] * __half2float(smem.v[k_idx * KV_STRIDE + d]);
+            // Compute attention scores: S = Q @ K^T
+            for (int k_idx = tid; k_idx < tokens_in_chunk; k_idx += THREADS) {
+                float sum = 0.0f;
+                #pragma unroll 8
+                for (int d = 0; d < D; ++d) {
+                    sum += __half2float(smem.q[d]) * __half2float(smem.k[k_idx * KV_STRIDE + d]);
+                }
+                smem.s[k_idx] = sum * softmax_scale;
             }
-            smem.o[d] += acc;
-        }
-        __syncthreads();
+            __syncthreads();
 
-        kv_pos += tokens_in_block;
+            // Online softmax: find max
+            float local_max = NEG_INF;
+            for (int k_idx = tid; k_idx < tokens_in_chunk; k_idx += THREADS) {
+                local_max = fmaxf(local_max, smem.s[k_idx]);
+            }
+
+            // Reduce max across warp (32 threads)
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+            }
+            float chunk_max = __shfl_sync(0xffffffff, local_max, 0);
+
+            // Rescale previous accumulator
+            float old_max = smem.row_max;
+            float new_max = fmaxf(old_max, chunk_max);
+            float exp_diff = __expf(old_max - new_max);
+
+            // Compute exp and sum
+            float local_sum = 0.0f;
+            for (int k_idx = tid; k_idx < tokens_in_chunk; k_idx += THREADS) {
+                float e = __expf(smem.s[k_idx] - new_max);
+                smem.s[k_idx] = e;
+                local_sum += e;
+            }
+            __syncthreads();
+
+            // Reduce sum across warp
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+            }
+            float chunk_sum = __shfl_sync(0xffffffff, local_sum, 0);
+
+            // Update running stats
+            if (tid == 0) {
+                smem.row_sum = exp_diff * smem.row_sum + chunk_sum;
+                smem.row_max = new_max;
+            }
+            __syncthreads();
+
+            // Rescale output accumulator
+            for (int d = tid; d < D; d += THREADS) {
+                smem.o[d] *= exp_diff;
+            }
+            __syncthreads();
+
+            // Accumulate weighted values: O += S @ V
+            for (int d = tid; d < D; d += THREADS) {
+                float acc = 0.0f;
+                for (int k_idx = 0; k_idx < tokens_in_chunk; ++k_idx) {
+                    acc += smem.s[k_idx] * __half2float(smem.v[k_idx * KV_STRIDE + d]);
+                }
+                smem.o[d] += acc;
+            }
+            __syncthreads();
+        }
+
+        kv_pos += total_in_block;
     }
 
     // Write output: O = O / sum
