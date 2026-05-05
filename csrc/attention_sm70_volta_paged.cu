@@ -239,6 +239,18 @@ cudaError_t launch_flash_attention_sm70_paged_decode(
     dim3 block(Config::THREADS_PER_BLOCK);
     size_t smem = Config::SMEM_SIZE;
 
+    // V100 default dynamic SMEM is 48 KB. D=256 needs ~68 KB, so opt into
+    // the 96 KB ceiling via cudaFuncSetAttribute. No-op when smem fits in
+    // the default (D=64 ~ 19 KB, D=128 ~ 36 KB).
+    if (smem > 48 * 1024) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            flash_attention_sm70_paged_decode_kernel<D>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem)
+        );
+        if (attr_err != cudaSuccess) return attr_err;
+    }
+
     flash_attention_sm70_paged_decode_kernel<D><<<grid, block, smem, stream>>>(
         Q, K_cache, V_cache, block_tables, seq_lens, Out,
         num_seqs, num_heads, num_kv_heads, max_blocks_per_seq,
@@ -255,6 +267,14 @@ template cudaError_t launch_flash_attention_sm70_paged_decode<64>(
     int, int, int, int, int, float, cudaStream_t);
 
 template cudaError_t launch_flash_attention_sm70_paged_decode<128>(
+    const __half*, const __half*, const __half*,
+    const int*, const int*, __half*,
+    int, int, int, int, int, float, cudaStream_t);
+
+// D=256 added for Qwen3.6 family (head_dim=256 on V100/SM70).
+// SMEM at D=256: q (528B) + k (33.8KB) + v (33.8KB) + s (256B) + o (1KB) ~= 68 KB,
+// fits within V100s 96 KB cap with the dynamic-smem opt-in above.
+template cudaError_t launch_flash_attention_sm70_paged_decode<256>(
     const __half*, const __half*, const __half*,
     const int*, const int*, __half*,
     int, int, int, int, int, float, cudaStream_t);

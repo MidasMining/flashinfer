@@ -62,7 +62,8 @@ void FlashAttentionSM70PagedDecode(
     int max_blocks_per_seq = block_tables.size(1);
 
     // Validate dimensions
-    TVM_FFI_ICHECK(D == 64 || D == 128) << "Head dim must be 64 or 128, got " << D;
+    TVM_FFI_ICHECK(D == 64 || D == 128 || D == 256)
+        << "Head dim must be 64, 128, or 256, got " << D;
     TVM_FFI_ICHECK_EQ(k_cache.size(3), D);
     TVM_FFI_ICHECK_EQ(v_cache.size(1), block_size);
     TVM_FFI_ICHECK_EQ(v_cache.size(2), num_kv_heads);
@@ -89,8 +90,15 @@ void FlashAttentionSM70PagedDecode(
             num_seqs, num_heads, num_kv_heads, max_blocks_per_seq,
             block_size, static_cast<float>(softmax_scale), stream
         );
-    } else {
+    } else if (D == 128) {
         status = sm70::paged::launch_flash_attention_sm70_paged_decode<128>(
+            q_ptr, k_ptr, v_ptr, block_tables_ptr, seq_lens_ptr, out_ptr,
+            num_seqs, num_heads, num_kv_heads, max_blocks_per_seq,
+            block_size, static_cast<float>(softmax_scale), stream
+        );
+    } else {
+        // D == 256 (asserted above)
+        status = sm70::paged::launch_flash_attention_sm70_paged_decode<256>(
             q_ptr, k_ptr, v_ptr, block_tables_ptr, seq_lens_ptr, out_ptr,
             num_seqs, num_heads, num_kv_heads, max_blocks_per_seq,
             block_size, static_cast<float>(softmax_scale), stream

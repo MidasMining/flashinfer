@@ -355,7 +355,9 @@ def paged_decode_attention(
     num_seqs, num_heads, head_dim = q.shape
 
     assert q.dtype == torch.float16, "SM70 paged attention requires FP16"
-    assert head_dim in [64, 128], f"Head dim must be 64 or 128, got {head_dim}"
+    assert head_dim in [64, 128, 256], (
+        f"Head dim must be 64, 128, or 256, got {head_dim}"
+    )
 
     # Ensure contiguous
     q = q.contiguous()
