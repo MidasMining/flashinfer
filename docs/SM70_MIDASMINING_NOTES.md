@@ -52,6 +52,6 @@ The "3.4-5× over SDPA" claim in `docs/SM70_BENCHMARK_RESULTS.md` was for D=64/1
 
 ## Cross-references
 
-- Full investigation log: [MidasMining/inference-research](https://192.168.1.45:3000/MidasMining/inference-research) (Gitea private), specifically `volta-sm70/INVESTIGATION_LOG.md` Round 4 for the detailed analysis of why this didn't beat vLLM Triton.
+- Full investigation log: [MidasMining/inference-research](http://192.168.1.45:3000/MidasMining/inference-research) (Gitea private), specifically `volta-sm70/INVESTIGATION_LOG.md` Round 4 for the detailed analysis of why this didn't beat vLLM Triton.
 - vLLM integration source: [MidasMining/vllm-tq](https://github.com/MidasMining/vllm-tq) `test-vibha-wht` branch. Phase 1 commit `c800aa0a3` is where the fork was wired in then unwired in favor of 1Cat-vLLM's `flash_attn_v100`.
 - Alternative Volta paged attention: [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — the vLLM fork bundled `flash_attn_v100` (multi-warp + Flash-Decoding) which we eventually adopted instead.
